@@ -17,7 +17,6 @@ const argv = yargs(hideBin(process.argv))
   .option('linkedinClientId', { type: 'string', demandOption: true, describe: "LinkedIn Client ID" })
   .option('linkedinClientSecret', { type: 'string', demandOption: true, describe: "LinkedIn Client Secret" })
   .option('linkedinRedirectUri', { type: 'string', demandOption: true, describe: "LinkedIn Redirect URI" })
-  .option('linkedinState', { type: 'string', default: '', describe: "LinkedIn State (optional)" })
   .help()
   .parseSync()
 
@@ -31,26 +30,26 @@ let linkedinAccessToken: string | null = null
 let linkedinUserId: string | null = null
 
 // --------------------------------------------------------------------
-// 3) LinkedIn OAuth Setup
+// 3) LinkedIn OAuth Setup (Using OpenID Connect)
 // --------------------------------------------------------------------
 const LINKEDIN_CLIENT_ID = argv.linkedinClientId
 const LINKEDIN_CLIENT_SECRET = argv.linkedinClientSecret
 const LINKEDIN_REDIRECT_URI = argv.linkedinRedirectUri
-const LINKEDIN_STATE = argv.linkedinState
 
 // Generate the LinkedIn OAuth URL
+// Request openid, profile and w_member_social scopes.
 function generateLinkedinAuthUrl(): string {
   const params = new URLSearchParams({
     response_type: 'code',
     client_id: LINKEDIN_CLIENT_ID,
     redirect_uri: LINKEDIN_REDIRECT_URI,
-    state: LINKEDIN_STATE,
-    scope: 'liteprofile w_member_social',
+    scope: 'openid profile w_member_social'
   })
   return `https://www.linkedin.com/oauth/v2/authorization?${params.toString()}`
 }
 
 // Exchange authorization code for access token
+// Note: With OpenID Connect, the token response may also include an id_token.
 async function exchangeLinkedinAuthCode(code: string): Promise<string> {
   const params = new URLSearchParams({
     grant_type: 'authorization_code',
@@ -72,17 +71,17 @@ async function exchangeLinkedinAuthCode(code: string): Promise<string> {
   return data.access_token
 }
 
-// Fetch authenticated user's profile to retrieve the LinkedIn user ID
+// Fetch authenticated user's profile using the userinfo endpoint to retrieve the LinkedIn user ID
 async function fetchLinkedinUser(): Promise<any> {
   if (!linkedinAccessToken) throw new Error('No LinkedIn access token available.')
-  const response = await fetch('https://api.linkedin.com/v2/me', {
+  const response = await fetch('https://api.linkedin.com/v2/userinfo', {
     headers: {
       'Authorization': `Bearer ${linkedinAccessToken}`
     }
   })
   const data = await response.json()
-  if (!data.id) throw new Error('Failed to fetch LinkedIn user id.')
-  linkedinUserId = data.id
+  if (!data.sub) throw new Error('Failed to fetch LinkedIn user id.')
+  linkedinUserId = data.sub
   return data
 }
 
@@ -158,7 +157,7 @@ function createMcpServer(): McpServer {
 
   server.tool(
     'linkedin_auth_url',
-    'Return an OAuth URL for LinkedIn (visit this URL to grant access with w_member_social scope).',
+    'Return an OAuth URL for LinkedIn (visit this URL to grant access with openid, profile, and w_member_social scopes).',
     {},
     async () => {
       try {
