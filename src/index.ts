@@ -61,9 +61,8 @@ class RedisLinkedInAuthStorage implements ILinkedInAuthStorage {
   }
 
   async get(memoryKey: string): Promise<{ accessToken: string; userId: string } | undefined> {
-    const data = await this.redis.get<string>(`${this.keyPrefix}:${memoryKey}`);
-    if (!data) return undefined;
-    return JSON.parse(data);
+    const data = await this.redis.get<{ accessToken: string; userId: string }>(`${this.keyPrefix}:${memoryKey}`);
+    return data === null ? undefined : data;
   }
 
   async set(memoryKey: string, accessToken: string, linkedinUserId: string): Promise<void> {
@@ -151,13 +150,8 @@ async function createLinkedinPostTool(args: { postContent: string; memoryKey: st
     body: JSON.stringify(postData)
   });
   if (!response.ok) {
-    let errorDetail;
-    try {
-      errorDetail = JSON.stringify(await response.json());
-    } catch {
-      errorDetail = await response.text();
-    }
-    throw new Error(`LinkedIn post creation failed: ${errorDetail}`);
+    const errorText = await response.text();
+    throw new Error(`LinkedIn post creation failed: ${errorText}`);
   }
   return { success: true, message: 'Post created successfully.' };
 }
