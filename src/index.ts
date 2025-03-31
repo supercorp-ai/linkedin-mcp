@@ -151,8 +151,13 @@ async function createLinkedinPostTool(args: { postContent: string; memoryKey: st
     body: JSON.stringify(postData)
   });
   if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`LinkedIn post creation failed: ${errorText}`);
+    let errorDetail;
+    try {
+      errorDetail = JSON.stringify(await response.json());
+    } catch {
+      errorDetail = await response.text();
+    }
+    throw new Error(`LinkedIn post creation failed: ${errorDetail}`);
   }
   return { success: true, message: 'Post created successfully.' };
 }
