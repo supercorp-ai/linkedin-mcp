@@ -10,19 +10,34 @@ import { z } from 'zod'
 import { Redis } from '@upstash/redis'
 
 // --------------------------------------------------------------------
+// Logging Helpers
+// --------------------------------------------------------------------
+function log(...args: any[]) {
+  console.log('[linkedin-mcp]', ...args);
+}
+
+function logErr(...args: any[]) {
+  console.error('[linkedin-mcp]', ...args);
+}
+
+// --------------------------------------------------------------------
+// Helper: JSON Response Formatter
+// --------------------------------------------------------------------
+function toTextJson(data: unknown): { content: Array<{ type: 'text'; text: string }> } {
+  return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+}
+
+// --------------------------------------------------------------------
 // Configuration & Storage Interface
 // --------------------------------------------------------------------
 interface Config {
   port: number;
   transport: 'sse' | 'stdio';
-  // Storage modes: "memory-single", "memory", or "upstash-redis-rest"
   storage: 'memory-single' | 'memory' | 'upstash-redis-rest';
   linkedinClientId: string;
   linkedinClientSecret: string;
   linkedinRedirectUri: string;
-  // For storage "memory" and "upstash-redis-rest": the header name (or key prefix) to use.
   storageHeaderKey?: string;
-  // Upstash-specific options (if storage is "upstash-redis-rest")
   upstashRedisRestUrl?: string;
   upstashRedisRestToken?: string;
 }
@@ -36,13 +51,17 @@ interface ILinkedInAuthStorage {
 // In-Memory Storage Implementation
 // --------------------------------------------------------------------
 class MemoryLinkedInAuthStorage implements ILinkedInAuthStorage {
-  private storage: Record<string, { accessToken: string; userId: string }> = {};
+  private storage: Record<string, { accessToken?: string; userId?: string }> = {};
 
-  async get(memoryKey: string) {
-    return this.storage[memoryKey];
+  async get(memoryKey: string): Promise<{ accessToken: string; userId: string } | undefined> {
+    const data = this.storage[memoryKey];
+    if (data && data.accessToken && data.userId) {
+      return { accessToken: data.accessToken, userId: data.userId };
+    }
+    return undefined;
   }
 
-  async set(memoryKey: string, accessToken: string, linkedinUserId: string) {
+  async set(memoryKey: string, accessToken: string, linkedinUserId: string): Promise<void> {
     this.storage[memoryKey] = { accessToken, userId: linkedinUserId };
   }
 }
@@ -60,8 +79,11 @@ class RedisLinkedInAuthStorage implements ILinkedInAuthStorage {
   }
 
   async get(memoryKey: string): Promise<{ accessToken: string; userId: string } | undefined> {
-    const data = await this.redis.get<{ accessToken: string; userId: string }>(`${this.keyPrefix}:${memoryKey}`);
-    return data === null ? undefined : data;
+    const data = await this.redis.get<{ accessToken?: string; userId?: string }>(`${this.keyPrefix}:${memoryKey}`);
+    if (data && data.accessToken && data.userId) {
+      return { accessToken: data.accessToken, userId: data.userId };
+    }
+    return undefined;
   }
 
   async set(memoryKey: string, accessToken: string, linkedinUserId: string): Promise<void> {
@@ -71,7 +93,7 @@ class RedisLinkedInAuthStorage implements ILinkedInAuthStorage {
 }
 
 // --------------------------------------------------------------------
-// LinkedIn OAuth Helper Functions (using config)
+// LinkedIn OAuth Helper Functions
 // --------------------------------------------------------------------
 function generateLinkedinAuthUrl(config: Config): string {
   const params = new URLSearchParams({
@@ -120,20 +142,131 @@ async function authLinkedin(args: { code: string; memoryKey: string; config: Con
   return { success: true, provider: "linkedin", user: userInfo };
 }
 
-async function createLinkedinPostTool(args: { postContent: string; memoryKey: string; storage: ILinkedInAuthStorage }): Promise<any> {
-  const { postContent, memoryKey, storage } = args;
+// --------------------------------------------------------------------
+// LinkedIn Image Upload Helper
+// --------------------------------------------------------------------
+/**
+ * Uploads an image to LinkedIn via the Assets API.
+ * Downloads the image from mediaUrl, registers the upload, uploads the binary file, and returns the asset URN.
+ */
+async function uploadLinkedinImage(mediaUrl: string, accessToken: string, ownerUrn: string): Promise<string> {
+  log("Downloading image for LinkedIn upload:", mediaUrl);
+  const mediaResponse = await fetch(mediaUrl);
+  if (!mediaResponse.ok) {
+    const errText = await mediaResponse.text();
+    logErr("Error downloading image:", errText);
+    throw new Error("Failed to download image for LinkedIn post.");
+  }
+  const mediaBuffer = await mediaResponse.arrayBuffer();
+  const imageBytes = Buffer.from(mediaBuffer);
+
+  // Register upload
+  const registerUrl = "https://api.linkedin.com/v2/assets?action=registerUpload";
+  const registerBody = {
+    registerUploadRequest: {
+      recipes: ["urn:li:digitalmediaRecipe:feedshare-image"],
+      owner: ownerUrn,
+      serviceRelationships: [
+        { relationshipType: "OWNER", identifier: "urn:li:userGeneratedContent" }
+      ]
+    }
+  };
+  log("Registering image upload with body:", JSON.stringify(registerBody));
+  const registerResponse = await fetch(registerUrl, {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${accessToken}`,
+      "Content-Type": "application/json",
+      "X-Restli-Protocol-Version": "2.0.0"
+    },
+    body: JSON.stringify(registerBody)
+  });
+  if (!registerResponse.ok) {
+    const errorText = await registerResponse.text();
+    logErr("Error in image register upload:", errorText);
+    throw new Error(`Image register upload failed: ${errorText}`);
+  }
+  const registerData = await registerResponse.json();
+  const uploadUrl = registerData.value.uploadMechanism["com.linkedin.digitalmedia.uploading.MediaUploadHttpRequest"].uploadUrl;
+  const asset = registerData.value.asset;
+  log("Image upload registered. Upload URL:", uploadUrl, "Asset:", asset);
+
+  // Upload the image binary using PUT.
+  const putResponse = await fetch(uploadUrl, {
+    method: "PUT",
+    headers: {
+      "Authorization": `Bearer ${accessToken}`,
+      "Content-Type": "application/octet-stream"
+    },
+    body: imageBytes
+  });
+  if (!putResponse.ok) {
+    const putError = await putResponse.text();
+    logErr("Error uploading image:", putError);
+    throw new Error(`Image upload failed: ${putError}`);
+  }
+  log("Image upload successful. Asset URN:", asset);
+  return asset;
+}
+
+// --------------------------------------------------------------------
+// LinkedIn Post Creation Tool (with optional image or article share)
+// --------------------------------------------------------------------
+interface LinkedInPostArgs {
+  postContent: string;
+  mediaType?: "none" | "image" | "article";
+  mediaUrl?: string;
+  articleUrl?: string;
+  title?: string;
+  description?: string;
+  memoryKey: string;
+  config: Config;
+  storage: ILinkedInAuthStorage;
+}
+
+async function createLinkedinPostTool(args: LinkedInPostArgs): Promise<any> {
+  const { postContent, mediaType = "none", mediaUrl, articleUrl, title, description, memoryKey, config, storage } = args;
   const creds = await storage.get(memoryKey);
   if (!creds) {
     throw new Error(`No LinkedIn authentication configured for key "${memoryKey}". Run linkedin_exchange_auth_code first.`);
   }
+  const author = `urn:li:person:${creds.userId}`;
+  let shareContent: any = {
+    shareCommentary: { text: postContent },
+    shareMediaCategory: "NONE"
+  };
+  if (mediaType === "image" && mediaUrl) {
+    const assetUrn = await uploadLinkedinImage(mediaUrl, creds.accessToken, author);
+    shareContent = {
+      shareCommentary: { text: postContent },
+      shareMediaCategory: "IMAGE",
+      media: [
+        {
+          status: "READY",
+          description: { text: description || "Image share" },
+          media: assetUrn,
+          title: { text: title || "Image" }
+        }
+      ]
+    };
+  } else if (mediaType === "article" && articleUrl) {
+    // For articles, LinkedIn will automatically extract metadata from the URL.
+    shareContent = {
+      shareCommentary: { text: postContent },
+      shareMediaCategory: "ARTICLE",
+      media: [
+        {
+          status: "READY",
+          originalUrl: articleUrl
+        }
+      ]
+    };
+  }
   const postData = {
-    author: `urn:li:person:${creds.userId}`,
+    author,
     lifecycleState: "PUBLISHED",
     specificContent: {
-      "com.linkedin.ugc.ShareContent": {
-        shareCommentary: { text: postContent },
-        shareMediaCategory: "NONE"
-      }
+      "com.linkedin.ugc.ShareContent": shareContent
     },
     visibility: {
       "com.linkedin.ugc.MemberNetworkVisibility": "PUBLIC"
@@ -156,23 +289,7 @@ async function createLinkedinPostTool(args: { postContent: string; memoryKey: st
 }
 
 // --------------------------------------------------------------------
-// Helper: JSON response formatter
-// --------------------------------------------------------------------
-function toTextJson(data: unknown) {
-  return {
-    content: [
-      {
-        type: 'text' as const,
-        text: JSON.stringify(data, null, 2)
-      }
-    ]
-  };
-}
-
-// --------------------------------------------------------------------
-// Create a LinkedIn MCP server
-// This function creates the storage instance internally based on the config
-// and returns an MCP server that uses the provided memoryKey.
+// MCP Server Creation: Register LinkedIn Tools
 // --------------------------------------------------------------------
 function createLinkedinServer(memoryKey: string, config: Config): McpServer {
   let storage: ILinkedInAuthStorage;
@@ -192,7 +309,7 @@ function createLinkedinServer(memoryKey: string, config: Config): McpServer {
 
   server.tool(
     'linkedin_auth_url',
-    'Return an OAuth URL for LinkedIn (visit this URL to grant access with openid, profile, and w_member_social scopes).',
+    'Return an OAuth URL for LinkedIn login. (Grants openid, profile, and w_member_social scopes.)',
     {},
     async () => {
       try {
@@ -206,9 +323,9 @@ function createLinkedinServer(memoryKey: string, config: Config): McpServer {
 
   server.tool(
     'linkedin_exchange_auth_code',
-    'Set up LinkedIn authentication by exchanging an auth code.',
-    { code: z.string() },
-    async (args) => {
+    'Exchange an auth code for a LinkedIn access token and set up authentication.',
+    { code: z.string().describe("Authorization code obtained from LinkedIn OAuth flow") },
+    async (args: { code: string }) => {
       try {
         const result = await authLinkedin({ code: args.code, memoryKey, config, storage });
         return toTextJson(result);
@@ -220,11 +337,18 @@ function createLinkedinServer(memoryKey: string, config: Config): McpServer {
 
   server.tool(
     'linkedin_create_post',
-    'Create a new post on LinkedIn on behalf of the authenticated member. Provide postContent as text.',
-    { postContent: z.string() },
-    async (args) => {
+    'Create a new LinkedIn post.\nArguments:\n  - postContent: The text content of the post.\n  - mediaType (optional): "none", "image", or "article". Use "image" to upload an image or "article" to share a URL.\n  - mediaUrl (optional): URL of the image to upload (required if mediaType is "image").\n  - articleUrl (optional): URL of the article to share (required if mediaType is "article").\n  - title (optional): Title for the media share (only used if mediaType is "image").\n  - description (optional): A short description for the media share (only used if mediaType is "image").',
+    {
+      postContent: z.string().describe("The text content of the post"),
+      mediaType: z.enum(["none", "image", "article"]).optional().describe("Specifies the type of media attached: 'image' for image upload, 'article' for URL share, 'none' for text only"),
+      mediaUrl: z.string().optional().describe("The URL of the image to upload (required if mediaType is 'image')"),
+      articleUrl: z.string().optional().describe("The URL of the article to share (required if mediaType is 'article')"),
+      title: z.string().optional().describe("Title for the image share"),
+      description: z.string().optional().describe("A short description for the image share")
+    },
+    async (args: { postContent: string; mediaType?: "none" | "image" | "article"; mediaUrl?: string; articleUrl?: string; title?: string; description?: string }) => {
       try {
-        const result = await createLinkedinPostTool({ postContent: args.postContent, memoryKey, storage });
+        const result = await createLinkedinPostTool({ ...args, memoryKey, config, storage });
         return toTextJson(result);
       } catch (err: any) {
         return toTextJson({ error: String(err.message) });
@@ -236,18 +360,7 @@ function createLinkedinServer(memoryKey: string, config: Config): McpServer {
 }
 
 // --------------------------------------------------------------------
-// Logging Helpers
-// --------------------------------------------------------------------
-function log(...args: any[]) {
-  console.log('[linkedin-mcp]', ...args);
-}
-
-function logErr(...args: any[]) {
-  console.error('[linkedin-mcp]', ...args);
-}
-
-// --------------------------------------------------------------------
-// Main: Start the server
+// Main: Start the Server (SSE or stdio)
 // --------------------------------------------------------------------
 async function main() {
   const argv = yargs(hideBin(process.argv))
@@ -266,6 +379,7 @@ async function main() {
     .option('storageHeaderKey', { type: 'string', describe: 'For storage "memory" or "upstash-redis-rest": the header name (or key prefix) to use.' })
     .option('upstashRedisRestUrl', { type: 'string', describe: 'Upstash Redis REST URL (if --storage=upstash-redis-rest)' })
     .option('upstashRedisRestToken', { type: 'string', describe: 'Upstash Redis REST token (if --storage=upstash-redis-rest)' })
+    .option('toolsPrefix', { type: 'string', default: 'linkedin_', describe: 'Prefix to add to all tool names.' })
     .help()
     .parseSync();
 
@@ -286,7 +400,6 @@ async function main() {
     upstashRedisRestToken: argv.upstashRedisRestToken,
   };
 
-  // Validate Upstash Redis options immediately if using upstash-redis-rest.
   if (config.storage === 'upstash-redis-rest') {
     if (!config.upstashRedisRestUrl || !config.upstashRedisRestUrl.trim()) {
       logErr("Error: --upstashRedisRestUrl is required for storage mode 'upstash-redis-rest'.");
@@ -299,7 +412,6 @@ async function main() {
   }
 
   if (config.transport === 'stdio') {
-    // For stdio, always run in memory-single mode.
     const memoryKey = "single";
     const server = createLinkedinServer(memoryKey, config);
     const transport = new StdioServerTransport();
@@ -308,9 +420,7 @@ async function main() {
     return;
   }
 
-  // For SSE transport:
   const app = express();
-
   interface ServerSession {
     memoryKey: string;
     server: McpServer;
@@ -319,7 +429,6 @@ async function main() {
   }
   let sessions: ServerSession[] = [];
 
-  // Parse JSON on all routes except /message.
   app.use((req, res, next) => {
     if (req.path === '/message') return next();
     express.json()(req, res, next);
@@ -330,7 +439,6 @@ async function main() {
     if (config.storage === 'memory-single') {
       memoryKey = "single";
     } else {
-      // In "memory" or "upstash-redis-rest", use the header named by storageHeaderKey.
       const headerVal = req.headers[config.storageHeaderKey!.toLowerCase()];
       if (typeof headerVal !== 'string' || !headerVal.trim()) {
         res.status(400).json({ error: `Missing or invalid "${config.storageHeaderKey}" header` });
@@ -338,7 +446,6 @@ async function main() {
       }
       memoryKey = headerVal.trim();
     }
-
     const server = createLinkedinServer(memoryKey, config);
     const transport = new SSEServerTransport('/message', res);
     await server.connect(transport);
@@ -359,14 +466,16 @@ async function main() {
     });
   });
 
-  app.post('/message', async (req: Request, res: Response) => {
+  app.post('/message', async (req, res) => {
     const sessionId = req.query.sessionId as string;
     if (!sessionId) {
+      logErr('Missing sessionId');
       res.status(400).send({ error: 'Missing sessionId' });
       return;
     }
     const target = sessions.find(s => s.sessionId === sessionId);
     if (!target) {
+      logErr(`No active session for sessionId=${sessionId}`);
       res.status(404).send({ error: 'No active session' });
       return;
     }
@@ -378,12 +487,12 @@ async function main() {
     }
   });
 
-  app.listen(config.port, () => {
-    log(`Listening on port ${config.port} [storage=${config.storage}]`);
+  app.listen(argv.port, () => {
+    log(`Listening on port ${argv.port} (${argv.transport}) [storage=${config.storage}]`);
   });
 }
 
-main().catch(err => {
+main().catch((err: any) => {
   logErr('Fatal error:', err);
   process.exit(1);
 });
