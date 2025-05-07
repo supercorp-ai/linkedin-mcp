@@ -310,7 +310,10 @@ function createLinkedinServer(memoryKey: string, config: Config): McpServer {
   server.tool(
     'linkedin_auth_url',
     'Return an OAuth URL for LinkedIn login. (Grants openid, profile, and w_member_social scopes.)',
-    {},
+    {
+      // TODO: MCP SDK bug patch - remove when fixed
+      comment: z.string().optional(),
+    },
     async () => {
       try {
         const authUrl = generateLinkedinAuthUrl(config);
