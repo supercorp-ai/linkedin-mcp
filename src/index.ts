@@ -6,8 +6,11 @@ import express, { Request, Response } from 'express'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
+import { InMemoryEventStore } from '@modelcontextprotocol/sdk/examples/shared/inMemoryEventStore.js'
 import { z } from 'zod'
 import { Redis } from '@upstash/redis'
+import { randomUUID } from 'node:crypto'
 
 // --------------------------------------------------------------------
 // Logging Helpers
@@ -32,7 +35,7 @@ function toTextJson(data: unknown): { content: Array<{ type: 'text'; text: strin
 // --------------------------------------------------------------------
 interface Config {
   port: number;
-  transport: 'sse' | 'stdio';
+  transport: 'sse' | 'stdio' | 'http';
   storage: 'memory-single' | 'memory' | 'upstash-redis-rest';
   linkedinClientId: string;
   linkedinClientSecret: string;
@@ -80,8 +83,9 @@ class RedisLinkedInAuthStorage implements ILinkedInAuthStorage {
 
   async get(memoryKey: string): Promise<{ accessToken: string; userId: string } | undefined> {
     const data = await this.redis.get<{ accessToken?: string; userId?: string }>(`${this.keyPrefix}:${memoryKey}`);
-    if (data && data.accessToken && data.userId) {
-      return { accessToken: data.accessToken, userId: data.userId };
+    if (data && (data as any).accessToken && (data as any).userId) {
+      const obj = data as any;
+      return { accessToken: obj.accessToken, userId: obj.userId };
     }
     return undefined;
   }
@@ -157,8 +161,10 @@ async function uploadLinkedinImage(mediaUrl: string, accessToken: string, ownerU
     logErr("Error downloading image:", errText);
     throw new Error("Failed to download image for LinkedIn post.");
   }
-  const mediaBuffer = await mediaResponse.arrayBuffer();
-  const imageBytes = Buffer.from(mediaBuffer);
+
+  // Use ArrayBuffer/Uint8Array to satisfy Node 24 typings (Buffer is not BodyInit in TS)
+  const mediaArrayBuffer = await mediaResponse.arrayBuffer();
+  const imageBytes = new Uint8Array(mediaArrayBuffer);
 
   // Register upload
   const registerUrl = "https://api.linkedin.com/v2/assets?action=registerUpload";
@@ -191,7 +197,7 @@ async function uploadLinkedinImage(mediaUrl: string, accessToken: string, ownerU
   const asset = registerData.value.asset;
   log("Image upload registered. Upload URL:", uploadUrl, "Asset:", asset);
 
-  // Upload the image binary using PUT.
+  // Upload the image binary using PUT (Uint8Array is accepted BodyInit)
   const putResponse = await fetch(uploadUrl, {
     method: "PUT",
     headers: {
@@ -363,12 +369,12 @@ function createLinkedinServer(memoryKey: string, config: Config): McpServer {
 }
 
 // --------------------------------------------------------------------
-// Main: Start the Server (SSE or stdio)
+// Main: Start the Server (HTTP / SSE / stdio)
 // --------------------------------------------------------------------
 async function main() {
   const argv = yargs(hideBin(process.argv))
     .option('port', { type: 'number', default: 8000 })
-    .option('transport', { type: 'string', choices: ['sse', 'stdio'], default: 'sse' })
+    .option('transport', { type: 'string', choices: ['sse', 'stdio', 'http'], default: 'sse' })
     .option('storage', {
       type: 'string',
       choices: ['memory-single', 'memory', 'upstash-redis-rest'],
@@ -388,7 +394,7 @@ async function main() {
 
   const config: Config = {
     port: argv.port,
-    transport: argv.transport as 'sse' | 'stdio',
+    transport: argv.transport as 'sse' | 'stdio' | 'http',
     storage: argv.storage as 'memory-single' | 'memory' | 'upstash-redis-rest',
     linkedinClientId: argv.linkedinClientId,
     linkedinClientSecret: argv.linkedinClientSecret,
@@ -414,6 +420,7 @@ async function main() {
     }
   }
 
+  // stdio
   if (config.transport === 'stdio') {
     const memoryKey = "single";
     const server = createLinkedinServer(memoryKey, config);
@@ -423,6 +430,153 @@ async function main() {
     return;
   }
 
+  // Streamable HTTP (root "/")
+  if (config.transport === 'http') {
+    const app = express();
+
+    // Do not JSON-parse "/" — transport needs raw body/stream
+    app.use((req, res, next) => {
+      if (req.path === '/') return next();
+      express.json()(req, res, next);
+    });
+
+    interface HttpSession {
+      memoryKey: string;
+      server: McpServer;
+      transport: StreamableHTTPServerTransport;
+    }
+    const sessions = new Map<string, HttpSession>();
+
+    function resolveMemoryKeyFromHeaders(req: Request): string | undefined {
+      if (config.storage === 'memory-single') return 'single';
+      const keyName = (config.storageHeaderKey as string).toLowerCase();
+      const headerVal = req.headers[keyName];
+      if (typeof headerVal !== 'string' || !headerVal.trim()) return undefined;
+      return headerVal.trim();
+    }
+
+    function createServerFor(memoryKey: string) {
+      return createLinkedinServer(memoryKey, config);
+    }
+
+    // POST / — JSON-RPC input; initializes a session if none exists
+    app.post('/', async (req: Request, res: Response) => {
+      try {
+        const sessionId = req.headers['mcp-session-id'] as string | undefined;
+
+        if (sessionId && sessions.has(sessionId)) {
+          const { transport } = sessions.get(sessionId)!;
+          await transport.handleRequest(req, res);
+          return;
+        }
+
+        // New initialization — require a valid memoryKey (no anonymous)
+        const memoryKey = resolveMemoryKeyFromHeaders(req);
+        if (!memoryKey) {
+          res.status(400).json({
+            jsonrpc: '2.0',
+            error: { code: -32000, message: `Bad Request: Missing or invalid "${config.storageHeaderKey}" header` },
+            id: (req as any)?.body?.id
+          });
+          return;
+        }
+
+        const server = createServerFor(memoryKey);
+        const eventStore = new InMemoryEventStore();
+
+        let transport!: StreamableHTTPServerTransport;
+        transport = new StreamableHTTPServerTransport({
+          sessionIdGenerator: () => randomUUID(),
+          eventStore,
+          onsessioninitialized: (newSessionId: string) => {
+            sessions.set(newSessionId, { memoryKey, server, transport });
+            log(`[${newSessionId}] HTTP session initialized for key "${memoryKey}"`);
+          }
+        });
+
+        transport.onclose = async () => {
+          const sid = transport.sessionId;
+          if (sid && sessions.has(sid)) {
+            sessions.delete(sid);
+            log(`[${sid}] Transport closed; removed session`);
+          }
+          try { await server.close(); } catch { /* already closed */ }
+        };
+
+        await server.connect(transport);
+        await transport.handleRequest(req, res);
+      } catch (err) {
+        logErr('Error handling HTTP POST /:', err);
+        if (!res.headersSent) {
+          res.status(500).json({
+            jsonrpc: '2.0',
+            error: { code: -32603, message: 'Internal server error' },
+            id: (req as any)?.body?.id
+          });
+        }
+      }
+    });
+
+    // GET / — server->client event stream
+    app.get('/', async (req: Request, res: Response) => {
+      const sessionId = req.headers['mcp-session-id'] as string | undefined;
+      if (!sessionId || !sessions.has(sessionId)) {
+        res.status(400).json({
+          jsonrpc: '2.0',
+          error: { code: -32000, message: 'Bad Request: No valid session ID provided' },
+          id: (req as any)?.body?.id
+        });
+        return;
+      }
+      try {
+        const { transport } = sessions.get(sessionId)!;
+        await transport.handleRequest(req, res);
+      } catch (err) {
+        logErr(`[${sessionId}] Error handling HTTP GET /:`, err);
+        if (!res.headersSent) {
+          res.status(500).json({
+            jsonrpc: '2.0',
+            error: { code: -32603, message: 'Internal server error' },
+            id: (req as any)?.body?.id
+          });
+        }
+      }
+    });
+
+    // DELETE / — session termination
+    app.delete('/', async (req: Request, res: Response) => {
+      const sessionId = req.headers['mcp-session-id'] as string | undefined;
+      if (!sessionId || !sessions.has(sessionId)) {
+        res.status(400).json({
+          jsonrpc: '2.0',
+          error: { code: -32000, message: 'Bad Request: No valid session ID provided' },
+          id: (req as any)?.body?.id
+        });
+        return;
+      }
+      try {
+        const { transport } = sessions.get(sessionId)!;
+        await transport.handleRequest(req, res);
+      } catch (err) {
+        logErr(`[${sessionId}] Error handling HTTP DELETE /:`, err);
+        if (!res.headersSent) {
+          res.status(500).json({
+            jsonrpc: '2.0',
+            error: { code: -32603, message: 'Error handling session termination' },
+            id: (req as any)?.body?.id
+          });
+        }
+      }
+    });
+
+    app.listen(config.port, () => {
+      log(`Listening on port ${config.port} (http) [storage=${config.storage}]`);
+    });
+
+    return; // do not fall through to SSE
+  }
+
+  // SSE
   const app = express();
   interface ServerSession {
     memoryKey: string;
@@ -491,7 +645,7 @@ async function main() {
   });
 
   app.listen(argv.port, () => {
-    log(`Listening on port ${argv.port} (${argv.transport}) [storage=${config.storage}]`);
+    log(`Listening on port ${argv.port} (sse) [storage=${config.storage}]`);
   });
 }
 
