@@ -3,6 +3,8 @@
 import { hideBin } from 'yargs/helpers'
 import yargs from 'yargs'
 import express, { Request, Response } from 'express'
+import cors from 'cors'
+import type { CorsOptionsDelegate } from 'cors'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
@@ -36,6 +38,7 @@ function toTextJson(data: unknown): { content: Array<{ type: 'text'; text: strin
 interface Config {
   port: number;
   transport: 'sse' | 'stdio' | 'http';
+  httpMode: 'stateful' | 'stateless';
   storage: 'memory-single' | 'memory' | 'upstash-redis-rest';
   linkedinClientId: string;
   linkedinClientSecret: string;
@@ -375,6 +378,13 @@ async function main() {
   const argv = yargs(hideBin(process.argv))
     .option('port', { type: 'number', default: 8000 })
     .option('transport', { type: 'string', choices: ['sse', 'stdio', 'http'], default: 'sse' })
+    .option('httpMode', {
+      type: 'string',
+      choices: ['stateful', 'stateless'] as const,
+      default: 'stateful',
+      describe:
+        'Choose HTTP session mode when --transport=http. "stateful" uses MCP session IDs; "stateless" treats each request separately.'
+    })
     .option('storage', {
       type: 'string',
       choices: ['memory-single', 'memory', 'upstash-redis-rest'],
@@ -395,6 +405,7 @@ async function main() {
   const config: Config = {
     port: argv.port,
     transport: argv.transport as 'sse' | 'stdio' | 'http',
+    httpMode: argv.httpMode as 'stateful' | 'stateless',
     storage: argv.storage as 'memory-single' | 'memory' | 'upstash-redis-rest',
     linkedinClientId: argv.linkedinClientId,
     linkedinClientSecret: argv.linkedinClientSecret,
@@ -420,6 +431,58 @@ async function main() {
     }
   }
 
+  const storageHeaderKeyLower = config.storageHeaderKey?.toLowerCase();
+  const storageHeaderLabel = config.storageHeaderKey ?? 'memory-key';
+  const corsBaseHeaders = [
+    'Content-Type',
+    'Accept',
+    'Mcp-Session-Id',
+    'mcp-session-id',
+    config.storageHeaderKey,
+    storageHeaderKeyLower
+  ].filter((header): header is string => typeof header === 'string' && header.length > 0);
+
+  const corsOptionsDelegate: CorsOptionsDelegate<Request> = (req, callback) => {
+    const headers = new Set<string>(corsBaseHeaders);
+    const requestHeaders = req.header('Access-Control-Request-Headers');
+    if (requestHeaders) {
+      for (const header of requestHeaders.split(',')) {
+        const trimmed = header.trim();
+        if (trimmed) headers.add(trimmed);
+      }
+    }
+    callback(null, {
+      origin: true,
+      allowedHeaders: Array.from(headers),
+      exposedHeaders: ['Mcp-Session-Id']
+    });
+  };
+
+  const corsMiddleware = cors(corsOptionsDelegate);
+
+  const resolveMemoryKeyFromHeaders = (headers: Request['headers']): string | undefined => {
+    if (config.storage === 'memory-single') {
+      return 'single';
+    }
+    if (!storageHeaderKeyLower) return undefined;
+    const raw = headers[storageHeaderKeyLower];
+    if (typeof raw === 'string') {
+      const trimmed = raw.trim();
+      return trimmed.length > 0 ? trimmed : undefined;
+    }
+    if (Array.isArray(raw)) {
+      for (const value of raw) {
+        if (typeof value === 'string') {
+          const trimmed = value.trim();
+          if (trimmed.length > 0) {
+            return trimmed;
+          }
+        }
+      }
+    }
+    return undefined;
+  };
+
   // stdio
   if (config.transport === 'stdio') {
     const memoryKey = "single";
@@ -432,152 +495,290 @@ async function main() {
 
   // Streamable HTTP (root "/")
   if (config.transport === 'http') {
+    const port = config.port;
     const app = express();
+    const isStatefulHttp = config.httpMode === 'stateful';
 
-    // Do not JSON-parse "/" — transport needs raw body/stream
-    app.use((req, res, next) => {
-      if (req.path === '/') return next();
-      express.json()(req, res, next);
-    });
+    app.use(corsMiddleware);
+    app.options('*', corsMiddleware);
 
-    interface HttpSession {
-      memoryKey: string;
-      server: McpServer;
-      transport: StreamableHTTPServerTransport;
-    }
-    const sessions = new Map<string, HttpSession>();
+    const createServerFor = (memoryKey: string) => createLinkedinServer(memoryKey, config);
 
-    function resolveMemoryKeyFromHeaders(req: Request): string | undefined {
-      if (config.storage === 'memory-single') return 'single';
-      const keyName = (config.storageHeaderKey as string).toLowerCase();
-      const headerVal = req.headers[keyName];
-      if (typeof headerVal !== 'string' || !headerVal.trim()) return undefined;
-      return headerVal.trim();
-    }
+    if (isStatefulHttp) {
+      // Do not JSON-parse "/" — the transport needs the raw body/stream.
+      app.use((req, res, next) => {
+        if (req.path === '/') return next();
+        return express.json()(req, res, next);
+      });
 
-    function createServerFor(memoryKey: string) {
-      return createLinkedinServer(memoryKey, config);
-    }
+      interface HttpSession {
+        memoryKey: string;
+        server: McpServer;
+        transport: StreamableHTTPServerTransport;
+      }
+      const sessions = new Map<string, HttpSession>();
+      const eventStore = new InMemoryEventStore();
 
-    // POST / — JSON-RPC input; initializes a session if none exists
-    app.post('/', async (req: Request, res: Response) => {
-      try {
-        const sessionId = req.headers['mcp-session-id'] as string | undefined;
+      app.post('/', async (req: Request, res: Response) => {
+        try {
+          const sessionId = req.headers['mcp-session-id'] as string | undefined;
+          if (sessionId && sessions.has(sessionId)) {
+            const { transport } = sessions.get(sessionId)!;
+            await transport.handleRequest(req, res);
+            return;
+          }
 
-        if (sessionId && sessions.has(sessionId)) {
-          const { transport } = sessions.get(sessionId)!;
+          const memoryKey = resolveMemoryKeyFromHeaders(req.headers);
+          if (!memoryKey) {
+            res.status(400).json({
+              jsonrpc: '2.0',
+              error: {
+                code: -32000,
+                message: `Bad Request: Missing or invalid "${storageHeaderLabel}" header`
+              },
+              id: (req as any)?.body?.id
+            });
+            return;
+          }
+
+          const server = createServerFor(memoryKey);
+
+          let transport!: StreamableHTTPServerTransport;
+          transport = new StreamableHTTPServerTransport({
+            sessionIdGenerator: () => randomUUID(),
+            eventStore,
+            onsessioninitialized: (newSessionId: string) => {
+              sessions.set(newSessionId, { memoryKey, server, transport });
+              log(`[${newSessionId}] HTTP session initialized for key "${memoryKey}"`);
+            }
+          });
+
+          transport.onclose = async () => {
+            const sid = transport.sessionId;
+            if (sid && sessions.has(sid)) {
+              sessions.delete(sid);
+              log(`[${sid}] Transport closed; removed session`);
+            }
+            try {
+              await server.close();
+            } catch {
+              // best-effort cleanup; ignore if already closed
+            }
+          };
+
+          await server.connect(transport);
           await transport.handleRequest(req, res);
+        } catch (err) {
+          logErr('Error handling HTTP POST /:', err);
+          if (!res.headersSent) {
+            res.status(500).json({
+              jsonrpc: '2.0',
+              error: { code: -32603, message: 'Internal server error' },
+              id: (req as any)?.body?.id
+            });
+          }
+        }
+      });
+
+      app.get('/', async (req: Request, res: Response) => {
+        const sessionId = req.headers['mcp-session-id'] as string | undefined;
+        if (!sessionId || !sessions.has(sessionId)) {
+          res.status(400).json({
+            jsonrpc: '2.0',
+            error: { code: -32000, message: 'Bad Request: No valid session ID provided' },
+            id: (req as any)?.body?.id
+          });
           return;
         }
+        try {
+          const { transport } = sessions.get(sessionId)!;
+          await transport.handleRequest(req, res);
+        } catch (err) {
+          logErr(`[${sessionId}] Error handling HTTP GET /:`, err);
+          if (!res.headersSent) {
+            res.status(500).json({
+              jsonrpc: '2.0',
+              error: { code: -32603, message: 'Internal server error' },
+              id: (req as any)?.body?.id
+            });
+          }
+        }
+      });
 
-        // New initialization — require a valid memoryKey (no anonymous)
-        const memoryKey = resolveMemoryKeyFromHeaders(req);
+      app.delete('/', async (req: Request, res: Response) => {
+        const sessionId = req.headers['mcp-session-id'] as string | undefined;
+        if (!sessionId || !sessions.has(sessionId)) {
+          res.status(400).json({
+            jsonrpc: '2.0',
+            error: { code: -32000, message: 'Bad Request: No valid session ID provided' },
+            id: (req as any)?.body?.id
+          });
+          return;
+        }
+        try {
+          const { transport } = sessions.get(sessionId)!;
+          await transport.handleRequest(req, res);
+        } catch (err) {
+          logErr(`[${sessionId}] Error handling HTTP DELETE /:`, err);
+          if (!res.headersSent) {
+            res.status(500).json({
+              jsonrpc: '2.0',
+              error: { code: -32603, message: 'Error handling session termination' },
+              id: (req as any)?.body?.id
+            });
+          }
+        }
+      });
+    } else {
+      app.use(express.json());
+
+      interface StatelessSession {
+        server: McpServer;
+        transport: StreamableHTTPServerTransport;
+        memoryKey: string;
+      }
+
+      const statelessSessions = new Map<string, StatelessSession>();
+      const statelessSessionPromises = new Map<string, Promise<StatelessSession>>();
+
+      const destroyStatelessSession = async (memoryKey: string) => {
+        const session = statelessSessions.get(memoryKey);
+        if (!session) return;
+        statelessSessions.delete(memoryKey);
+        statelessSessionPromises.delete(memoryKey);
+        try {
+          await session.transport.close();
+        } catch (err) {
+          logErr(`[stateless:${memoryKey}] Error closing transport:`, err);
+        }
+        try {
+          await session.server.close();
+        } catch (err) {
+          logErr(`[stateless:${memoryKey}] Error closing server:`, err);
+        }
+      };
+
+      const getOrCreateStatelessSession = async (memoryKey: string): Promise<StatelessSession> => {
+        const existing = statelessSessions.get(memoryKey);
+        if (existing) {
+          return existing;
+        }
+
+        const pending = statelessSessionPromises.get(memoryKey);
+        if (pending) {
+          return pending;
+        }
+
+        const creation = (async () => {
+          const server = createServerFor(memoryKey);
+          const transport = new StreamableHTTPServerTransport({
+            sessionIdGenerator: undefined
+          });
+          transport.onerror = error => {
+            logErr(`[stateless:${memoryKey}] Streamable HTTP transport error:`, error);
+          };
+          transport.onclose = async () => {
+            statelessSessions.delete(memoryKey);
+            statelessSessionPromises.delete(memoryKey);
+            try {
+              await server.close();
+            } catch (err) {
+              logErr(`[stateless:${memoryKey}] Error closing server on transport close:`, err);
+            }
+          };
+          await server.connect(transport);
+          const session: StatelessSession = { server, transport, memoryKey };
+          statelessSessions.set(memoryKey, session);
+          return session;
+        })()
+          .catch(err => {
+            statelessSessionPromises.delete(memoryKey);
+            throw err;
+          })
+          .finally(() => {
+            statelessSessionPromises.delete(memoryKey);
+          });
+
+        statelessSessionPromises.set(memoryKey, creation);
+        return creation;
+      };
+
+      const handleStatelessRequest = async (
+        req: Request,
+        res: Response,
+        handler: (session: StatelessSession, memoryKey: string) => Promise<void>
+      ) => {
+        const memoryKey = resolveMemoryKeyFromHeaders(req.headers);
         if (!memoryKey) {
           res.status(400).json({
             jsonrpc: '2.0',
-            error: { code: -32000, message: `Bad Request: Missing or invalid "${config.storageHeaderKey}" header` },
-            id: (req as any)?.body?.id
+            error: {
+              code: -32000,
+              message: `Bad Request: Missing or invalid "${storageHeaderLabel}" header`
+            },
+            id: (req as any)?.body?.id ?? null
           });
           return;
         }
 
-        const server = createServerFor(memoryKey);
-        const eventStore = new InMemoryEventStore();
+        try {
+          const session = await getOrCreateStatelessSession(memoryKey);
+          await handler(session, memoryKey);
+        } catch (err) {
+          logErr('Error handling MCP request (stateless):', err);
+          if (!res.headersSent) {
+            res.status(500).json({
+              jsonrpc: '2.0',
+              error: { code: -32603, message: 'Internal server error' },
+              id: (req as any)?.body?.id ?? null
+            });
+          }
+        }
+      };
 
-        let transport!: StreamableHTTPServerTransport;
-        transport = new StreamableHTTPServerTransport({
-          sessionIdGenerator: () => randomUUID(),
-          eventStore,
-          onsessioninitialized: (newSessionId: string) => {
-            sessions.set(newSessionId, { memoryKey, server, transport });
-            log(`[${newSessionId}] HTTP session initialized for key "${memoryKey}"`);
+      app.post('/', async (req: Request, res: Response) => {
+        await handleStatelessRequest(req, res, async ({ transport }, memoryKey) => {
+          res.on('close', () => {
+            if (!res.writableEnded) {
+              logErr(`[stateless:${memoryKey}] POST connection closed prematurely; destroying session`);
+              void destroyStatelessSession(memoryKey);
+            }
+          });
+
+          await transport.handleRequest(req, res, req.body);
+        });
+      });
+
+      app.get('/', async (req: Request, res: Response) => {
+        await handleStatelessRequest(req, res, async ({ transport }) => {
+          await transport.handleRequest(req, res);
+        });
+      });
+
+      app.delete('/', async (req: Request, res: Response) => {
+        await handleStatelessRequest(req, res, async ({ transport }, memoryKey) => {
+          try {
+            await transport.handleRequest(req, res);
+          } finally {
+            void destroyStatelessSession(memoryKey);
           }
         });
+      });
+    }
 
-        transport.onclose = async () => {
-          const sid = transport.sessionId;
-          if (sid && sessions.has(sid)) {
-            sessions.delete(sid);
-            log(`[${sid}] Transport closed; removed session`);
-          }
-          try { await server.close(); } catch { /* already closed */ }
-        };
-
-        await server.connect(transport);
-        await transport.handleRequest(req, res);
-      } catch (err) {
-        logErr('Error handling HTTP POST /:', err);
-        if (!res.headersSent) {
-          res.status(500).json({
-            jsonrpc: '2.0',
-            error: { code: -32603, message: 'Internal server error' },
-            id: (req as any)?.body?.id
-          });
-        }
-      }
+    app.listen(port, () => {
+      log(
+        `Listening for Streamable HTTP on port ${port} [storage=${config.storage}, httpMode=${config.httpMode}]`
+      );
     });
 
-    // GET / — server->client event stream
-    app.get('/', async (req: Request, res: Response) => {
-      const sessionId = req.headers['mcp-session-id'] as string | undefined;
-      if (!sessionId || !sessions.has(sessionId)) {
-        res.status(400).json({
-          jsonrpc: '2.0',
-          error: { code: -32000, message: 'Bad Request: No valid session ID provided' },
-          id: (req as any)?.body?.id
-        });
-        return;
-      }
-      try {
-        const { transport } = sessions.get(sessionId)!;
-        await transport.handleRequest(req, res);
-      } catch (err) {
-        logErr(`[${sessionId}] Error handling HTTP GET /:`, err);
-        if (!res.headersSent) {
-          res.status(500).json({
-            jsonrpc: '2.0',
-            error: { code: -32603, message: 'Internal server error' },
-            id: (req as any)?.body?.id
-          });
-        }
-      }
-    });
-
-    // DELETE / — session termination
-    app.delete('/', async (req: Request, res: Response) => {
-      const sessionId = req.headers['mcp-session-id'] as string | undefined;
-      if (!sessionId || !sessions.has(sessionId)) {
-        res.status(400).json({
-          jsonrpc: '2.0',
-          error: { code: -32000, message: 'Bad Request: No valid session ID provided' },
-          id: (req as any)?.body?.id
-        });
-        return;
-      }
-      try {
-        const { transport } = sessions.get(sessionId)!;
-        await transport.handleRequest(req, res);
-      } catch (err) {
-        logErr(`[${sessionId}] Error handling HTTP DELETE /:`, err);
-        if (!res.headersSent) {
-          res.status(500).json({
-            jsonrpc: '2.0',
-            error: { code: -32603, message: 'Error handling session termination' },
-            id: (req as any)?.body?.id
-          });
-        }
-      }
-    });
-
-    app.listen(config.port, () => {
-      log(`Listening on port ${config.port} (http) [storage=${config.storage}]`);
-    });
-
-    return; // do not fall through to SSE
+    return;
   }
 
   // SSE
   const app = express();
+  app.use(corsMiddleware);
+  app.options('*', corsMiddleware);
   interface ServerSession {
     memoryKey: string;
     server: McpServer;
@@ -592,16 +793,10 @@ async function main() {
   });
 
   app.get('/', async (req: Request, res: Response) => {
-    let memoryKey: string;
-    if (config.storage === 'memory-single') {
-      memoryKey = "single";
-    } else {
-      const headerVal = req.headers[config.storageHeaderKey!.toLowerCase()];
-      if (typeof headerVal !== 'string' || !headerVal.trim()) {
-        res.status(400).json({ error: `Missing or invalid "${config.storageHeaderKey}" header` });
-        return;
-      }
-      memoryKey = headerVal.trim();
+    const memoryKey = resolveMemoryKeyFromHeaders(req.headers);
+    if (!memoryKey) {
+      res.status(400).json({ error: `Missing or invalid "${storageHeaderLabel}" header` });
+      return;
     }
     const server = createLinkedinServer(memoryKey, config);
     const transport = new SSEServerTransport('/message', res);
@@ -644,8 +839,8 @@ async function main() {
     }
   });
 
-  app.listen(argv.port, () => {
-    log(`Listening on port ${argv.port} (sse) [storage=${config.storage}]`);
+  app.listen(config.port, () => {
+    log(`Listening on port ${config.port} (sse) [storage=${config.storage}]`);
   });
 }
 
